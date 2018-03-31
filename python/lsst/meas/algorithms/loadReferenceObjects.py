@@ -32,6 +32,7 @@ import lsst.afw.geom as afwGeom
 import lsst.afw.table as afwTable
 import lsst.pex.config as pexConfig
 import lsst.pipe.base as pipeBase
+import lsst.pex.exceptions as pexExcept
 from lsst.daf.base import PropertyList
 from future.utils import with_metaclass
 
@@ -105,6 +106,11 @@ class LoadReferenceObjectsConfig(pexConfig.Config):
         itemtype=str,
         default={},
     )
+    requireProperMotion = pexConfig.Field(
+        doc="Require that the proper motion correction be successful?",
+        dtype=bool,
+        default=False,
+    )
 
 # The following comment block adds a link to this task from the Task Documentation page.
 ## \addtogroup LSST_task_documentation
@@ -174,6 +180,14 @@ class LoadReferenceObjectsTask(with_metaclass(abc.ABCMeta, pipeBase.Task)):
     ConfigClass = LoadReferenceObjectsConfig
     _DefaultName = "LoadReferenceObjects"
 
+    _properMotionColumns = pipeBase.Struct(
+        ra = "pmRa",
+        dec = "pmDec",
+        raErr = "pmRaErr",
+        decErr = "pmDecErr",
+        epoch = "epoch",
+    )
+
     def __init__(self, butler=None, *args, **kwargs):
         """!Construct a LoadReferenceObjectsTask
 
@@ -184,7 +198,7 @@ class LoadReferenceObjectsTask(with_metaclass(abc.ABCMeta, pipeBase.Task)):
         self.butler = butler
 
     @pipeBase.timeMethod
-    def loadPixelBox(self, bbox, wcs, filterName=None, calib=None):
+    def loadPixelBox(self, bbox, wcs, filterName=None, calib=None, epoch=None):
         """!Load reference objects that overlap a pixel-based rectangular region
 
         The search algorithm works by searching in a region in sky coordinates whose center is the center
@@ -195,6 +209,7 @@ class LoadReferenceObjectsTask(with_metaclass(abc.ABCMeta, pipeBase.Task)):
         @param[in] wcs  WCS (an lsst.afw.geom.SkyWcs)
         @param[in] filterName  name of camera filter, or None or blank for the default filter
         @param[in] calib  calibration, or None if unknown
+        @param[in] epoch  Epoch for proper motion correction (MJD TAI), or None
 
         @return an lsst.pipe.base.Struct containing:
         - refCat a catalog of reference objects with the
@@ -222,13 +237,18 @@ class LoadReferenceObjectsTask(with_metaclass(abc.ABCMeta, pipeBase.Task)):
         return loadRes
 
     @abc.abstractmethod
-    def loadSkyCircle(self, ctrCoord, radius, filterName=None):
+    def loadSkyCircle(self, ctrCoord, radius, filterName=None, epoch=None):
         """!Load reference objects that overlap a circular sky region
 
         @param[in] ctrCoord  ICRS center of search region (an lsst.afw.geom.SpherePoint)
         @param[in] radius  radius of search region (an lsst.afw.geom.Angle)
         @param[in] filterName  name of filter, or None for the default filter;
             used for flux values in case we have flux limits (which are not yet implemented)
+        @param[in] epoch  Epoch for proper motion correction (MJD TAI), or None
+
+        Note that subclasses are responsible for performing the proper motion
+        correction, since this is the lowest-level interface for retrieving
+        the catalog.
 
         @return an lsst.pipe.base.Struct containing:
         - refCat a catalog of reference objects with the
@@ -373,7 +393,7 @@ class LoadReferenceObjectsTask(with_metaclass(abc.ABCMeta, pipeBase.Task)):
         radius = max(coord.separation(wcs.pixelToSky(pp)) for pp in bbox.getCorners())
         return pipeBase.Struct(coord=coord, radius=radius, bbox=bbox)
 
-    def getMetadataBox(self, bbox, wcs, filterName=None, calib=None):
+    def getMetadataBox(self, bbox, wcs, filterName=None, calib=None, epoch=None):
         """!Return metadata about the load
 
         This metadata is used for reloading the catalog (e.g., for
@@ -383,12 +403,13 @@ class LoadReferenceObjectsTask(with_metaclass(abc.ABCMeta, pipeBase.Task)):
         @param[in] wcs  WCS (an lsst.afw.geom.SkyWcs)
         @param[in] filterName  name of camera filter, or None or blank for the default filter
         @param[in] calib  calibration, or None if unknown
+        @param[in] epoch  Epoch for proper motion correction (MJD TAI), or None
         @return metadata (lsst.daf.base.PropertyList)
         """
         circle = self._calculateCircle(bbox, wcs)
         return self.getMetadataCircle(circle.coord, circle.radius, filterName, calib)
 
-    def getMetadataCircle(self, coord, radius, filterName, calib=None):
+    def getMetadataCircle(self, coord, radius, filterName, calib=None, epoch=None):
         """!Return metadata about the load
 
         This metadata is used for reloading the catalog (e.g., for
@@ -398,6 +419,7 @@ class LoadReferenceObjectsTask(with_metaclass(abc.ABCMeta, pipeBase.Task)):
         @param[in] radius  radius of circle (lsst.afw.geom.Angle)
         @param[in] filterName  name of camera filter, or None or blank for the default filter
         @param[in] calib  calibration, or None if unknown
+        @param[in] epoch  Epoch for proper motion correction (MJD TAI), or None
         @return metadata (lsst.daf.base.PropertyList)
         """
         md = PropertyList()
@@ -407,6 +429,7 @@ class LoadReferenceObjectsTask(with_metaclass(abc.ABCMeta, pipeBase.Task)):
         md.add('SMATCHV', 1, 'SourceMatchVector version number')
         filterName = "UNKNOWN" if filterName is None else str(filterName)
         md.add('FILTER', filterName, 'filter name for photometric data')
+        md.add('EPOCH', "NONE" if epoch is None else epoch, 'Epoch (TAI MJD) for catalog')
         return md
 
     def joinMatchListWithCatalog(self, matchCat, sourceCat):
@@ -434,7 +457,91 @@ class LoadReferenceObjectsTask(with_metaclass(abc.ABCMeta, pipeBase.Task)):
         ctrCoord = afwGeom.SpherePoint(matchmeta.getDouble('RA'),
                                        matchmeta.getDouble('DEC'), afwGeom.degrees)
         rad = matchmeta.getDouble('RADIUS') * afwGeom.degrees
-        refCat = self.loadSkyCircle(ctrCoord, rad, filterName).refCat
+        try:
+            epoch = matchmeta.getDouble('EPOCH')
+        except (pexExcept.NotFoundError, pexExcept.TypeError):
+            epoch = None  # Not present, or not correct type means it's not set
+        refCat = self.loadSkyCircle(ctrCoord, rad, filterName, epoch=epoch).refCat
         refCat.sort()
         sourceCat.sort()
         return afwTable.unpackMatches(matchCat, refCat, sourceCat)
+
+    def calculateProperMotionScales(self, catalog, epoch):
+        """Calculate the scaling factor(s) for proper motion
+
+        The scaling factor is the number (or numbers, if the value
+        varies per source) by which to multiply the proper motion
+        rates in the catalog in order to get the proper motion.
+        It means calculating the amount of time between the
+        reference catalog epoch and the desired epoch, and specifying
+        the units of proper motion.
+
+        Parameters
+        ----------
+        catalog : `lsst.afw.table.SimpleCatalog`
+            Reference catalog. By default, this contains a column
+            ``epoch``, which is the mean epoch of the source as a
+            Modified Julian Date (MJD) in TAI.
+        epoch : `float`
+            Epoch to which to move objects (TAI MJD).
+
+        Returns
+        -------
+        struct : `lsst.pipe.base.Struct`
+            Struct of proper motion scales, containing:
+
+            - ``values`` : values of the proper motion scale (may be
+                either a scalar `float` or an `numpy.ndarray`)
+            - ``units`` : units of proper motion (`lsst.afw.geom.Angle`)
+        """
+        timeDiff = (epoch - catalog[self._properMotionColumns.epoch])/365.25  # Time difference, years
+        return pipeBase.Struct(values=timeDiff, units=1.0e-3*afwGeom.arcseconds)
+
+    def applyProperMotions(self, catalog, epoch):
+        """Apply proper motion to the catalog
+
+        The positions in the ``catalog`` are wound to the desired
+        ``epoch`` (specified as a Modified Julian Date). The ``catalog``
+        is modified in-place.
+
+        Parameters
+        ----------
+        catalog : `lsst.afw.table.SimpleCatalog`
+            Catalog of positions, containing:
+
+            - Coordinates, retrieved by the table's coordinate key.
+            - ``coord_ra_err`` : Error in Right Ascension (arcsec).
+            - ``coord_dec_err`` : Error in Declination (arcsec).
+            - ``pmRa`` : Proper motion in Right Ascension (mas/yr,
+                East positive)
+            - ``pmRaErr`` : Error in ``pmRa`` (mas/yr), optional.
+            - ``pmDec`` : Proper motion in Declination (mas/yr,
+                North positive)
+            - ``pmDecErr`` : Error in ``pmDec`` (mas/yr), optional.
+            - ``epoch`` : Mean epoch of object (TAI MJD).
+
+        epoch : `float`
+            Epoch to which to move objects (TAI MJD).
+        """
+        if (self._properMotionColumns.ra not in catalog.schema or
+            self._properMotionColumns.dec not in catalog.schema):
+            if self.config.requireProperMotion:
+                raise RuntimeError("Proper motion correction required but not available from catalog")
+            self.log.warn("Proper motion correction not available from catalog")
+            return
+        self.log.debug("Correcting reference catalog for proper motion to %f", epoch)
+        scales = self.calculateProperMotionScales(catalog, epoch)
+        arcsecScale = scales.values*scales.units.asArcseconds()  # Motion per unit proper motion, arcsec
+        coordKey = catalog.table.getCoordKey()
+        motionRa = catalog[self._properMotionColumns.ra]*arcsecScale  # arcsec
+        motionDec = catalog[self._properMotionColumns.dec]*arcsecScale  # arcsec
+        bearing = numpy.arctan2(motionDec, motionRa)  # radians
+        amount = numpy.hypot(motionRa, motionDec)  # arcsec
+        for record, aa, bb in zip(catalog, amount, bearing):
+            record.set(coordKey, record.get(coordKey).offset(bb*afwGeom.radians, aa*afwGeom.arcseconds))
+        if "coord_ra_err" in catalog.schema:
+            catalog["coord_ra_err"] = numpy.hypot(catalog["coord_ra_err"],
+                                                  catalog[self._properMotionColumns.raErr]*arcsecScale)
+        if "coord_dec_err" in catalog.schema:
+            catalog["coord_dec_err"] = numpy.hypot(catalog["coord_dec_err"],
+                                                   catalog[self._properMotionColumns.decErr]*arcsecScale)

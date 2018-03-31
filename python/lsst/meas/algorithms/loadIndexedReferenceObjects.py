@@ -54,13 +54,14 @@ class LoadIndexedReferenceObjectsTask(LoadReferenceObjectsTask):
         self.butler = butler
 
     @pipeBase.timeMethod
-    def loadSkyCircle(self, ctrCoord, radius, filterName=None):
+    def loadSkyCircle(self, ctrCoord, radius, filterName=None, epoch=None):
         """!Load reference objects that overlap a circular sky region
 
         @param[in] ctrCoord  center of search region (an lsst.afw.geom.Coord)
         @param[in] radius  radius of search region (an lsst.afw.geom.Angle)
         @param[in] filterName  name of filter, or None for the default filter;
             used for flux values in case we have flux limits (which are not yet implemented)
+        @param[in] epoch  Epoch for proper motion correction (MJD TAI), or None
 
         @return an lsst.pipe.base.Struct containing:
         - refCat a catalog of reference objects with the
@@ -87,6 +88,9 @@ class LoadIndexedReferenceObjectsTask(LoadReferenceObjectsTask):
         # make sure catalog is contiguous
         if not refCat.isContiguous():
             refCat = refCat.copy()
+
+        if epoch is not None:
+            self.applyProperMotions(refCat, epoch)
 
         # add and initialize centroid and hasCentroid fields (these are added
         # after loading to avoid wasting space in the saved catalogs)
