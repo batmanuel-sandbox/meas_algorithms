@@ -89,6 +89,16 @@ class IngestIndexedReferenceConfig(pexConfig.Config):
         dtype=str,
         doc="Name of Dec column",
     )
+    ra_err_name = pexConfig.Field(
+        dtype=str,
+        doc="Name of RA error column",
+        optional=True,
+    )
+    dec_err_name = pexConfig.Field(
+        dtype=str,
+        doc="Name of Dec error column",
+        optional=True,
+    )
     mag_column_list = pexConfig.ListField(
         dtype=str,
         doc="The values in the reference catalog are assumed to be in AB magnitudes. "
@@ -120,6 +130,42 @@ class IngestIndexedReferenceConfig(pexConfig.Config):
         optional=True,
         doc='Name of column to use as an identifier (optional).'
     )
+    pm_ra_name = pexConfig.Field(
+        dtype=str,
+        doc="Name of proper motion RA column",
+        optional=True,
+    )
+    pm_dec_name = pexConfig.Field(
+        dtype=str,
+        doc="Name of proper motion Dec column",
+        optional=True,
+    )
+    pm_ra_err_name = pexConfig.Field(
+        dtype=str,
+        doc="Name of proper motion RA error column",
+        optional=True,
+    )
+    pm_dec_err_name = pexConfig.Field(
+        dtype=str,
+        doc="Name of proper motion Dec error column",
+        optional=True,
+    )
+    pm_scale = pexConfig.Field(
+        dtype=float,
+        doc="Scale factor by which to multiply proper motion values to obtain units of milliarcsec/year",
+        default=1.0,
+    )
+    epoch_name = pexConfig.Field(
+        dtype=str,
+        doc="Name of epoch column",
+        optional=True,
+    )
+    epoch_poly = pexConfig.ListField(
+        dtype=float,
+        doc="Coefficients of ordinary polynomial to convert epoch values to MJD TAI, "
+            "from zeroth to highest order. To convert from Unix time, use [40587.0, 1.0/86400].",
+        default=[0.0],
+    )
     extra_col_names = pexConfig.ListField(
         dtype=str,
         default=[],
@@ -131,8 +177,15 @@ class IngestIndexedReferenceConfig(pexConfig.Config):
         if not (self.ra_name and self.dec_name and self.mag_column_list):
             raise ValueError("ra_name and dec_name and at least one entry in mag_column_list must be" +
                              " supplied.")
+        if (self.pm_ra_err_name is not None) != (self.pm_dec_err_name is not None):  # XOR
+            raise ValueError("Only one of ra_err_name and dec_err_name has been specified")
         if len(self.mag_err_column_map) > 0 and not len(self.mag_column_list) == len(self.mag_err_column_map):
             raise ValueError("If magnitude errors are provided, all magnitudes must have an error column")
+        if (sum(1 for col in ("pm_ra_name", "pm_dec_name", "epoch_name") if getattr(self, col) is not None)
+            not in (0, 3)):
+            raise ValueError("Only all or none of pm_ra_name, pm_dec_name and epoch_name may be specified")
+        if (self.pm_ra_err_name is not None) != (self.pm_dec_err_name is not None):  # XOR
+            raise ValueError("Only one of pm_ra_err_name and pm_dec_err_name has been specified")
 
 
 class IngestIndexedReferenceTask(pipeBase.CmdLineTask):
@@ -169,6 +222,7 @@ class IngestIndexedReferenceTask(pipeBase.CmdLineTask):
         pipeBase.Task.__init__(self, *args, **kwargs)
         self.indexer = IndexerRegistry[self.config.dataset_config.indexer.name](
             self.config.dataset_config.indexer.active)
+        self.epoch_poly = np.polynomial.Polynomial(self.config.epoch_poly)
         self.makeSubtask('file_reader')
 
     def create_indexed_catalog(self, files):
@@ -212,6 +266,28 @@ class IngestIndexedReferenceTask(pipeBase.CmdLineTask):
         """
         return afwGeom.SpherePoint(row[ra_name], row[dec_name], afwGeom.degrees)
 
+    def _set_errors(self, record, row, key_map):
+        """Set the coordinate errors from the input
+
+        The errors are read from the specified columns, and installed
+        in the appropriate columns of the output.
+
+        Parameters
+        ----------
+        record : `lsst.afw.table.SourceRecord`
+            Source record to modify.
+        row : `dict`-like
+            Row from numpy table.
+        key_map : `dict` mapping `str` to `lsst.afw.table.Key`
+            Map of catalog keys.
+        """
+        if self.config.ra_err_name is None:  # IngestIndexedReferenceConfig.validate ensures all or none
+            record.set(key_map["coord_ra_err"], 0.0)
+            record.set(key_map["coord_dec_err"], 0.0)
+            return
+        record.set(key_map["coord_ra_err"], row[self.config.ra_err_name])
+        record.set(key_map["coord_dec_err"], row[self.config.dec_err_name])
+
     def _set_flags(self, record, row, key_map):
         """!Set the flags for a record.  Relies on the _flags class attribute
         @param[in,out] record  SourceCatalog record to modify
@@ -237,6 +313,32 @@ class IngestIndexedReferenceTask(pipeBase.CmdLineTask):
                 error_col_name = self.config.mag_err_column_map[err_key]
                 record.set(key_map[err_key+'_fluxSigma'],
                            fluxErrFromABMagErr(row[error_col_name], row[err_key]))
+
+    def _set_proper_motion(self, record, row, key_map):
+        """Set the proper motions from the input
+
+        The proper motions are read from the specified columns,
+        scaled appropriately, and installed in the appropriate
+        columns of the output.
+
+        Parameters
+        ----------
+        record : `lsst.afw.table.SourceRecord`
+            Source record to modify.
+        row : `dict`-like
+            Row from numpy table.
+        key_map : `dict` mapping `str` to `lsst.afw.table.Key`
+            Map of catalog keys.
+        """
+        if self.config.pm_ra_name is None:  # IngestIndexedReferenceConfig.validate ensures all or none
+            return
+        record.set(key_map["pmRa"], row[self.config.pm_ra_name]*self.config.pm_scale)
+        record.set(key_map["pmDec"], row[self.config.pm_dec_name]*self.config.pm_scale)
+        record.set(key_map["epoch"], self.epoch_poly(row[self.config.epoch_name]))
+        if self.config.pm_ra_err_name is None or self.config.pm_dec_err_name is None:
+            return
+        record.set(key_map["pmRaErr"], row[self.config.pm_ra_err_name]*self.config.pm_scale)
+        record.set(key_map["pmDecErr"], row[self.config.pm_dec_err_name]*self.config.pm_scale)
 
     def _set_extra(self, record, row, key_map):
         """!Copy the extra column information to the record
@@ -274,8 +376,10 @@ class IngestIndexedReferenceTask(pipeBase.CmdLineTask):
         # No parents
         record.setParent(-1)
 
+        self._set_errors(record, row, key_map)
         self._set_flags(record, row, key_map)
         self._set_mags(record, row, key_map)
+        self._set_proper_motion(record, row, key_map)
         self._set_extra(record, row, key_map)
         return rec_num
 
@@ -317,6 +421,9 @@ class IngestIndexedReferenceTask(pipeBase.CmdLineTask):
                 at_type = dtype[name].type
                 return schema.addField(name, at_type)
 
+        key_map["coord_ra_err"] = schema.addField("coord_ra_err", float)
+        key_map["coord_dec_err"] = schema.addField("coord_dec_err", float)
+
         for item in mag_column_list:
             key_map[item+'_flux'] = schema.addField(item+'_flux', float)
         if len(mag_err_column_map) > 0:
@@ -326,6 +433,13 @@ class IngestIndexedReferenceTask(pipeBase.CmdLineTask):
             attr_name = 'is_{}_name'.format(flag)
             if getattr(self.config, attr_name):
                 key_map[flag] = schema.addField(flag, 'Flag')
+        if self.config.pm_ra_name is not None:  # pm_dec_name and epoch_name also; by validation
+            key_map["pmRa"] = schema.addField("pmRa", float)
+            key_map["pmDec"] = schema.addField("pmDec", float)
+            key_map["epoch"] = schema.addField("epoch", float)
+            if self.config.pm_ra_err_name is not None:  # pm_dec_err_name also; by validation
+                key_map["pmRaErr"] = schema.addField("pmRaErr", float)
+                key_map["pmDecErr"] = schema.addField("pmDecErr", float)
         for col in self.config.extra_col_names:
             key_map[col] = add_field(col)
         return schema, key_map

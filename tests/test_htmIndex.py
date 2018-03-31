@@ -33,6 +33,7 @@ from collections import Counter
 
 import numpy as np
 
+from lsst.daf.base import DateTime
 import lsst.afw.table as afwTable
 import lsst.afw.geom as afwGeom
 import lsst.daf.persistence as dafPersist
@@ -53,14 +54,15 @@ def make_coord(ra, dec):
 
 
 class HtmIndexTestCase(lsst.utils.tests.TestCase):
-
-    @staticmethod
-    def make_sky_catalog(out_path, size=1000):
+    @classmethod
+    def make_sky_catalog(cls, out_path, size=1000):
         np.random.seed(123)
         ident = np.arange(1, size+1, dtype=int)
         ra = np.random.random(size)*360.
         dec = np.degrees(np.arccos(2.*np.random.random(size) - 1.))
         dec -= 90.
+        ra_err = np.ones(size)*0.1  # arcsec
+        dec_err = np.ones(size)*0.1  # arcsec
         a_mag = 16. + np.random.random(size)*4.
         a_mag_err = 0.01 + np.random.random(size)*0.2
         b_mag = 17. + np.random.random(size)*5.
@@ -70,26 +72,35 @@ class HtmIndexTestCase(lsst.utils.tests.TestCase):
         is_variable = np.random.randint(2, size=size)
         extra_col1 = np.random.normal(size=size)
         extra_col2 = np.random.normal(1000., 100., size=size)
+        pm_ra = -np.ones(size)*cls.proper_motion  # arcsec/year
+        pm_dec = np.zeros(size)  # arcsec/year
+        pm_ra_err = np.ones(size)*0.001  # arcsec/year
+        pm_dec_err = np.ones(size)*0.001  # arcsec/year
+        unixtime = np.ones(size)*DateTime(cls.mjd).nsecs()/1.0e9  # Unix time
 
         def get_word(word_len):
             return "".join(np.random.choice([s for s in string.ascii_letters], word_len))
         extra_col3 = np.array([get_word(num) for num in np.random.randint(11, size=size)])
 
-        dtype = np.dtype([('id', float), ('ra_icrs', float), ('dec_icrs', float), ('a', float),
+        dtype = np.dtype([('id', float), ('ra_icrs', float), ('dec_icrs', float),
+                         ('ra_err', float), ('dec_err', float), ('a', float),
                           ('a_err', float), ('b', float), ('b_err', float), ('is_phot', int),
                           ('is_res', int), ('is_var', int), ('val1', float), ('val2', float),
-                          ('val3', '|S11')])
+                          ('val3', '|S11'), ('pm_ra', float), ('pm_dec', float), ('pm_ra_err', float),
+                          ('pm_dec_err', float), ('unixtime', float)])
 
-        arr = np.array(list(zip(ident, ra, dec, a_mag, a_mag_err, b_mag, b_mag_err, is_photometric,
-                                is_resolved, is_variable, extra_col1, extra_col2, extra_col3)), dtype=dtype)
-        np.savetxt(out_path+"/ref.txt", arr, delimiter=",",
-                   header="id,ra_icrs,dec_icrs,a,a_err,b,b_err,is_phot,is_res,is_var,val1,val2,val3",
-                   fmt=["%i", "%.6g", "%.6g", "%.4g", "%.4g", "%.4g", "%.4g", "%i",
-                        "%i", "%i", "%.2g", "%.2g", "%s"])
-        np.savetxt(out_path+"/ref_test_delim.txt", arr, delimiter="|",
-                   header="id,ra_icrs,dec_icrs,a,a_err,b,b_err,is_phot,is_res,is_var,val1,val2,val3",
-                   fmt=["%i", "%.6g", "%.6g", "%.4g", "%.4g", "%.4g", "%.4g", "%i",
-                        "%i", "%i", "%.2g", "%.2g", "%s"])
+        arr = np.array(list(zip(ident, ra, dec, ra_err, dec_err, a_mag, a_mag_err, b_mag, b_mag_err,
+                                is_photometric, is_resolved, is_variable, extra_col1, extra_col2, extra_col3,
+                                pm_ra, pm_dec, pm_ra_err, pm_dec_err, unixtime)), dtype=dtype)
+        saveKwargs = dict(
+            header="id,ra_icrs,dec_icrs,ra_err,dec_err,a,a_err,b,b_err,is_phot,is_res,is_var,val1,val2,val3,"
+                   "pm_ra,pm_dec,pm_ra_err,pm_dec_err,unixtime",
+            fmt=["%i", "%.6g", "%.6g", "%.4g", "%.4g", "%.4g", "%.4g", "%.4g", "%.4g", "%i",
+                 "%i", "%i", "%.2g", "%.2g", "%s", "%.4g", "%.4g", "%.4g", "%.4g", "%.6f"]
+        )
+
+        np.savetxt(out_path+"/ref.txt", arr, delimiter=",", **saveKwargs)
+        np.savetxt(out_path+"/ref_test_delim.txt", arr, delimiter="|", **saveKwargs)
         return out_path+"/ref.txt", out_path+"/ref_test_delim.txt", arr
 
     @classmethod
@@ -98,6 +109,8 @@ class HtmIndexTestCase(lsst.utils.tests.TestCase):
         cls.test_cat_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "data",
                                          "testHtmIndex.fits")
         cls.test_cat = afwTable.SourceCatalog.readFits(cls.test_cat_path)
+        cls.proper_motion = 3.0  # arcsec/year
+        cls.mjd = 58206.861330339219  # MJD for now
         ret = cls.make_sky_catalog(cls.out_path)
         cls.sky_catalog_file, cls.sky_catalog_file_delim, cls.sky_catalog = ret
         cls.test_ras = [210., 14.5, 93., 180., 286., 0.]
@@ -105,6 +118,7 @@ class HtmIndexTestCase(lsst.utils.tests.TestCase):
         cls.search_radius = 3. * afwGeom.degrees
         cls.comp_cats = {}  # dict of center coord: list of IDs of stars within cls.search_radius of center
         cls.depth = 4  # gives a mean area of 20 deg^2 per pixel, roughly matching a 3 deg search radius
+
         config = IndexerRegistry['HTM'].ConfigClass()
         # Match on disk comparison file
         config.depth = cls.depth
@@ -127,6 +141,13 @@ class HtmIndexTestCase(lsst.utils.tests.TestCase):
         config.mag_column_list = ['a', 'b']
         config.id_name = 'id'
         config.mag_err_column_map = {'a': 'a_err', 'b': 'b_err'}
+        config.pm_ra_name = "pm_ra"
+        config.pm_dec_name = "pm_dec"
+        config.pm_ra_err_name = "pm_ra_err"
+        config.pm_dec_err_name = "pm_dec_err"
+        config.epoch_name = "unixtime"
+        config.epoch_poly = [40587.0, 1.0/86400]  # Unix time --> MJD
+        config.pm_scale = 1000.0  # arcsec/yr --> mas/yr
         IngestIndexedReferenceTask.parseAndRun(args=[input_dir, "--output", cls.test_repo_path,
                                                      cls.sky_catalog_file], config=config)
         cls.default_dataset_name = config.dataset_config.ref_dataset_name
@@ -198,6 +219,14 @@ class HtmIndexTestCase(lsst.utils.tests.TestCase):
                 config=default_config)
         # test with multiple files and correct config
         default_config.mag_err_column_map = {'a': 'a_err', 'b': 'b_err'}
+        default_config.ra_err_name = "ra_err"
+        default_config.dec_err_name = "dec_err"
+        default_config.pm_ra_name = "pm_ra"
+        default_config.pm_dec_name = "pm_dec"
+        default_config.epoch_name = "unixtime"
+        default_config.pm_ra_err_name = "pm_ra_err"
+        default_config.pm_dec_err_name = "pm_dec_err"
+        default_config.pm_scale = 1.0e-3  # arcsec/yr --> mas/yr
         IngestIndexedReferenceTask.parseAndRun(
             args=[input_dir, "--output", self.out_path+"/output_multifile",
                   self.sky_catalog_file, self.sky_catalog_file],
@@ -218,8 +247,11 @@ class HtmIndexTestCase(lsst.utils.tests.TestCase):
         default_config.id_name = 'id'
         default_config.extra_col_names = ['val1', 'val2', 'val3']
         default_config.file_reader.header_lines = 1
-        default_config.file_reader.colnames = ['id', 'ra', 'dec', 'a', 'a_err', 'b', 'b_err', 'is_phot',
-                                               'is_res', 'is_var', 'val1', 'val2', 'val3']
+        default_config.file_reader.colnames = [
+            'id', 'ra', 'dec', 'ra_err', 'dec_err', 'a', 'a_err', 'b', 'b_err', 'is_phot',
+            'is_res', 'is_var', 'val1', 'val2', 'val3', 'pm_ra', 'pm_dec', 'pm_ra_err',
+            'pm_dec_err', 'unixtime',
+        ]
         default_config.file_reader.delimiter = '|'
         # this also tests changing the delimiter
         IngestIndexedReferenceTask.parseAndRun(
@@ -308,6 +340,29 @@ class HtmIndexTestCase(lsst.utils.tests.TestCase):
                 self.assertTrue(aprimeFluxFieldName in lcat.refCat.schema)
                 break  # just need one test
 
+    def testProperMotion(self):
+        """Test proper motion correction"""
+        center = make_coord(93.0, -90.0)
+        loader = LoadIndexedReferenceObjectsTask(butler=self.test_butler)
+        references = loader.loadSkyCircle(center, self.search_radius, filterName='a').refCat
+        original = references.copy(True)
+
+        # Zero epoch change --> no proper motion correction (except minor numerical effects)
+        loader.applyProperMotions(references, self.mjd)
+        self.assertFloatsAlmostEqual(references["coord_ra"], original["coord_ra"], rtol=1.0e-14)
+        self.assertFloatsAlmostEqual(references["coord_dec"], original["coord_dec"], rtol=1.0e-14)
+        self.assertFloatsEqual(references["coord_ra_err"], original["coord_ra_err"])
+        self.assertFloatsEqual(references["coord_dec_err"], original["coord_dec_err"])
+
+        # One year difference --> coordinate difference should be self.proper_motion in RA only
+        loader.applyProperMotions(references, self.mjd + 365.25)
+        for orig, ref in zip(original, references):
+            self.assertFloatsAlmostEqual(orig.getCoord().bearingTo(ref.getCoord()).asDegrees(),
+                                         180.0, rtol=1.0e-9)
+            self.assertFloatsAlmostEqual(orig.getCoord().separation(ref.getCoord()).asArcseconds(),
+                                         self.proper_motion, rtol=1.0e-12)
+
+        # XXXX check errors are modified
 
 class TestMemory(lsst.utils.tests.MemoryTestCase):
     pass
