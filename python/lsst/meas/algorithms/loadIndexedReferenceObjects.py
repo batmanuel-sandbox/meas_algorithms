@@ -22,7 +22,7 @@
 #
 from __future__ import absolute_import, division, print_function
 
-__all__ = ["LoadIndexedReferenceObjectsConfig", "LoadIndexedReferenceObjectsTask"]
+__all__ = ["LoadIndexedReferenceObjectsConfig", "LoadIndexedReferenceObjectsTask", "LoadPanstarrsObjectsTask"]
 
 from builtins import zip
 from lsst.meas.algorithms import getRefFluxField, LoadReferenceObjectsTask, LoadReferenceObjectsConfig
@@ -140,3 +140,50 @@ class LoadIndexedReferenceObjectsTask(LoadReferenceObjectsTask):
             if record.getCoord().separation(ctrCoord) < radius:
                 temp_cat.append(record)
         return temp_cat
+
+
+class LoadPanstarrsObjectsTask(LoadIndexedReferenceObjectsTask):
+    """Reference catalog loader for ps1_pv3_3pi_20170110 catalog
+
+    This catalog is in the "LSST format" suitable for use with
+    the `LoadIndexedReferenceObjectsTask`, but has a slightly
+    different format for the proper motion columns than was
+    eventually adopted for the default of the LSST format:
+
+    - The proper motions are in units of arcsec/yr instead of mas/yr.
+    - The epoch is in seconds since the Unix epoch instead of MJD.
+
+    Overriding the ``calculateProperMotionScales`` method is
+    sufficient to remedy these.
+    """
+    def calculateProperMotionScales(self, catalog, epoch):
+        """Calculate the scaling factor(s) for proper motion
+
+        The scaling factor is the number (or numbers, if the value
+        varies per source) by which to multiply the proper motion
+        rates in the catalog in order to get the proper motion.
+        It means calculating the amount of time between the
+        reference catalog epoch and the desired epoch, and specifying
+        the units of proper motion.
+
+        Parameters
+        ----------
+        catalog : `lsst.afw.table.SimpleCatalog`
+            Reference catalog. By default, this contains a column
+            ``epoch``, which is the mean epoch of the source as a
+            Modified Julian Date (MJD) in TAI.
+        epoch : `float`
+            Epoch to which to move objects (TAI MJD).
+
+        Returns
+        -------
+        struct : `lsst.pipe.base.Struct`
+            Struct of proper motion scales, containing:
+
+            - ``values`` : values of the proper motion scale (may be
+                either a scalar `float` or an `numpy.ndarray`)
+            - ``units`` : units of proper motion (`lsst.afw.geom.Angle`)
+        """
+        epochUnix = DateTime(float(epoch), DateTime.TAI).nsecs()/1.0e9  # Sec since Unix epoch
+        timeDiff = (epochUnix - catalog["epoch"])/(3600*24*365.25)  # Time difference, years
+        return pipeBase.Struct(values=timeDiff, units=afwGeom.arcseconds)
